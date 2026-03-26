@@ -1,0 +1,28 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: bistro-order-processing-sample
+  namespace: ds551-2026-spring-a5f0d1
+  labels:
+    app.kubernetes.io/name: bistro-order-processing-sample
+    app.kubernetes.io/part-of: petit-agile-bistro-order-pipeline
+spec:
+  pipelineRef:
+    name: bistro-order-processing
+  taskRunTemplate:
+    serviceAccountName: bistro-pipeline
+  params:
+    - name: restaurant-id
+      value: ds551-2026-spring-a5f0d1
+    - name: order-json
+      value: |
+        {
+          "order_id": "ord-1001",
+          "item_id": "burger-001",
+          "table_number": 12,
+          "timestamp": "2026-03-26T17:30:00Z",
+          "order_type": "food",
+          "customer_name": "Sam"
+        }
+  timeouts:
+    pipeline: 5m0s

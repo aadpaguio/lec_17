@@ -1,0 +1,47 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: bistro-order-processing
+  namespace: ds551-2026-spring-a5f0d1
+  labels:
+    app.kubernetes.io/name: bistro-order-processing
+    app.kubernetes.io/part-of: petit-agile-bistro-order-pipeline
+spec:
+  description: |
+    Tekton representation of the Petit Agile Bistro order processing flow:
+    raw order -> validate-order -> valid order -> route-and-enrich -> kitchen/bar/manager-alerts.
+    Retries are intentionally set to zero to match the Mermaid diagram.
+  params:
+    - name: order-json
+      type: string
+      description: Raw JSON order event produced by the POS terminal.
+    - name: restaurant-id
+      type: string
+      description: Restaurant identifier to inject during enrichment.
+      default: ds551-2026-spring-a5f0d1
+  tasks:
+    - name: validate-order
+      retries: 0
+      taskRef:
+        kind: Task
+        name: validate-order
+      params:
+        - name: order-json
+          value: $(params.order-json)
+    - name: route-and-enrich
+      runAfter:
+        - validate-order
+      retries: 0
+      when:
+        - input: $(tasks.validate-order.results.is-valid)
+          operator: in
+          values:
+            - "true"
+      taskRef:
+        kind: Task
+        name: route-and-enrich
+      params:
+        - name: order-json
+          value: $(tasks.validate-order.results.valid-order)
+        - name: restaurant-id
+          value: $(params.restaurant-id)

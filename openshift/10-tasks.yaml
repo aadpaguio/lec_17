@@ -1,0 +1,171 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: validate-order
+  namespace: ds551-2026-spring-a5f0d1
+  labels:
+    app.kubernetes.io/name: validate-order
+    app.kubernetes.io/part-of: petit-agile-bistro-order-pipeline
+spec:
+  description: |
+    Validates the minimal order schema from the Mermaid diagram.
+    Invalid orders are logged and discarded instead of sent to a dead-letter queue.
+  params:
+    - name: order-json
+      type: string
+      description: Raw JSON order event produced by the POS terminal.
+  results:
+    - name: is-valid
+      type: string
+      description: "true when the order contains item_id, table_number, and timestamp."
+    - name: valid-order
+      type: string
+      description: The original order JSON when valid, otherwise empty.
+    - name: validation-message
+      type: string
+      description: Human-readable validation outcome.
+  steps:
+    - name: validate
+      image: python:3.11-alpine
+      computeResources:
+        requests:
+          cpu: 100m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
+      script: |
+        #!/usr/bin/env python3
+        import json
+        import pathlib
+
+        order_json = r'''$(params.order-json)'''
+        required_fields = ["item_id", "table_number", "timestamp"]
+
+        is_valid_path = pathlib.Path("$(results.is-valid.path)")
+        valid_order_path = pathlib.Path("$(results.valid-order.path)")
+        message_path = pathlib.Path("$(results.validation-message.path)")
+
+        try:
+          payload = json.loads(order_json)
+        except json.JSONDecodeError as exc:
+          is_valid_path.write_text("false")
+          valid_order_path.write_text("")
+          message_path.write_text(f"invalid JSON discarded: {exc}")
+          print(f"[validate-order] invalid JSON discarded: {exc}")
+          raise SystemExit(0)
+
+        missing = [field for field in required_fields if field not in payload]
+        if missing:
+          is_valid_path.write_text("false")
+          valid_order_path.write_text("")
+          message_path.write_text(
+            "discarded missing required field(s): " + ", ".join(missing)
+          )
+          print(
+            "[validate-order] discarded missing required field(s): "
+            + ", ".join(missing)
+          )
+          raise SystemExit(0)
+
+        is_valid_path.write_text("true")
+        valid_order_path.write_text(json.dumps(payload, separators=(",", ":")))
+        message_path.write_text("order validated and published to valid-orders")
+        print("[validate-order] order validated and published to valid-orders")
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: route-and-enrich
+  namespace: ds551-2026-spring-a5f0d1
+  labels:
+    app.kubernetes.io/name: route-and-enrich
+    app.kubernetes.io/part-of: petit-agile-bistro-order-pipeline
+spec:
+  description: |
+    Adds processed_at and restaurant_id, then routes the order based on order_type.
+    Unknown types are ignored and simulated write failures are caught and skipped.
+  params:
+    - name: order-json
+      type: string
+      description: Valid JSON order event from the validate-order task.
+    - name: restaurant-id
+      type: string
+      description: Restaurant identifier to add during enrichment.
+      default: ds551-2026-spring-a5f0d1
+  results:
+    - name: route-status
+      type: string
+      description: Summarizes which simulated topic received the order.
+    - name: kitchen-order
+      type: string
+      description: Enriched payload for the kitchen topic or empty string.
+    - name: bar-order
+      type: string
+      description: Enriched payload for the bar topic or empty string.
+    - name: manager-alert
+      type: string
+      description: Alert payload for the manager-alerts topic or empty string.
+  steps:
+    - name: route
+      image: python:3.11-alpine
+      computeResources:
+        requests:
+          cpu: 100m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
+      script: |
+        #!/usr/bin/env python3
+        import json
+        import pathlib
+        from datetime import datetime, timezone
+
+        order_json = r'''$(params.order-json)'''
+        restaurant_id = "$(params.restaurant-id)"
+
+        route_status_path = pathlib.Path("$(results.route-status.path)")
+        kitchen_path = pathlib.Path("$(results.kitchen-order.path)")
+        bar_path = pathlib.Path("$(results.bar-order.path)")
+        manager_alert_path = pathlib.Path("$(results.manager-alert.path)")
+
+        kitchen_path.write_text("")
+        bar_path.write_text("")
+        manager_alert_path.write_text("")
+
+        try:
+          payload = json.loads(order_json)
+          payload["processed_at"] = datetime.now(timezone.utc).isoformat()
+          payload["restaurant_id"] = restaurant_id
+
+          order_type = payload.get("order_type")
+          encoded = json.dumps(payload, separators=(",", ":"))
+
+          if payload.get("simulate_write_failure") is True:
+            raise RuntimeError("simulated downstream write failure")
+
+          if order_type == "food":
+            kitchen_path.write_text(encoded)
+            route_status_path.write_text("published to kitchen")
+            print("[route-and-enrich] published to kitchen topic")
+          elif order_type == "drink":
+            bar_path.write_text(encoded)
+            route_status_path.write_text("published to bar")
+            print("[route-and-enrich] published to bar topic")
+          else:
+            route_status_path.write_text("ignored unsupported order_type")
+            manager_alert_path.write_text(
+              json.dumps(
+                {
+                  "reason": "unsupported order_type",
+                  "order": payload,
+                },
+                separators=(",", ":"),
+              )
+            )
+            print("[route-and-enrich] unsupported order_type ignored")
+        except Exception as exc:
+          route_status_path.write_text(f"write failure caught and skipped: {exc}")
+          print(f"[route-and-enrich] write failure caught and skipped: {exc}")
+          raise SystemExit(0)
