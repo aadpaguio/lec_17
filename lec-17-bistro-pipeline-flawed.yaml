@@ -1,0 +1,253 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: validate-order
+  labels:
+    app.kubernetes.io/name: validate-order
+    app.kubernetes.io/part-of: lx17a-bistro-pipeline
+spec:
+  description: |
+    [B] validate-order
+
+    Fix 1 (dead-letter-missing):
+    - Instead of discarding invalid events, emit them as results for a DLQ path.
+  params:
+    - name: order-json
+      type: string
+      description: Raw JSON order event produced by the POS terminal.
+  results:
+    - name: is-valid
+      type: string
+      description: "true when the order contains item_id, table_number, and timestamp."
+    - name: valid-order
+      type: string
+      description: The original order JSON when valid, otherwise empty.
+    - name: invalid-order
+      type: string
+      description: The original order JSON when invalid, otherwise empty.
+    - name: validation-error
+      type: string
+      description: Reason the order was considered invalid.
+  steps:
+    - name: validate
+      image: python:3.11-alpine
+      computeResources:
+        requests:
+          cpu: 100m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
+      script: |
+        #!/usr/bin/env python3
+        import json
+        import pathlib
+
+        order_json = r'''$(params.order-json)'''
+        required_fields = ["item_id", "table_number", "timestamp"]
+
+        is_valid_path = pathlib.Path("$(results.is-valid.path)")
+        valid_order_path = pathlib.Path("$(results.valid-order.path)")
+        invalid_order_path = pathlib.Path("$(results.invalid-order.path)")
+        error_path = pathlib.Path("$(results.validation-error.path)")
+
+        # Defaults
+        valid_order_path.write_text("")
+        invalid_order_path.write_text("")
+        error_path.write_text("")
+
+        try:
+          payload = json.loads(order_json)
+        except json.JSONDecodeError as exc:
+          is_valid_path.write_text("false")
+          invalid_order_path.write_text(order_json)
+          error_path.write_text(f"invalid JSON: {exc}")
+          print(f"[validate-order] invalid JSON -> DLQ: {exc}")
+          raise SystemExit(0)
+
+        missing = [field for field in required_fields if field not in payload]
+        if missing:
+          is_valid_path.write_text("false")
+          invalid_order_path.write_text(json.dumps(payload, separators=(",", ":")))
+          error_path.write_text("missing required field(s): " + ", ".join(missing))
+          print("[validate-order] missing required field(s) -> DLQ: " + ", ".join(missing))
+          raise SystemExit(0)
+
+        is_valid_path.write_text("true")
+        valid_order_path.write_text(json.dumps(payload, separators=(",", ":")))
+        print("[validate-order] valid -> continue")
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: route-and-enrich
+  labels:
+    app.kubernetes.io/name: route-and-enrich
+    app.kubernetes.io/part-of: lx17a-bistro-pipeline
+spec:
+  description: |
+    [D] route-and-enrich
+
+    Fix 2 (retry-missing):
+    - Do NOT swallow downstream write failures; fail the step so Tekton retries can work.
+  params:
+    - name: order-json
+      type: string
+      description: Valid JSON order event from validate-order.
+    - name: restaurant-id
+      type: string
+      default: petit-agile-bistro
+      description: Restaurant identifier to add during enrichment.
+  results:
+    - name: route-status
+      type: string
+      description: Summarizes which simulated topic received the order.
+    - name: kitchen-order
+      type: string
+      description: Enriched payload for the kitchen topic or empty string.
+    - name: bar-order
+      type: string
+      description: Enriched payload for the bar topic or empty string.
+    - name: manager-alert
+      type: string
+      description: Alert payload for the manager-alerts topic or empty string.
+  steps:
+    - name: route
+      image: python:3.11-alpine
+      computeResources:
+        requests:
+          cpu: 100m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
+      script: |
+        #!/usr/bin/env python3
+        import json
+        import pathlib
+        from datetime import datetime, timezone
+
+        order_json = r'''$(params.order-json)'''
+        restaurant_id = "$(params.restaurant-id)"
+
+        route_status_path = pathlib.Path("$(results.route-status.path)")
+        kitchen_path = pathlib.Path("$(results.kitchen-order.path)")
+        bar_path = pathlib.Path("$(results.bar-order.path)")
+        manager_alert_path = pathlib.Path("$(results.manager-alert.path)")
+
+        kitchen_path.write_text("")
+        bar_path.write_text("")
+        manager_alert_path.write_text("")
+
+        payload = json.loads(order_json)
+        payload["processed_at"] = datetime.now(timezone.utc).isoformat()
+        payload["restaurant_id"] = restaurant_id
+
+        # Simulated transient failure (used to demonstrate retries)
+        if payload.get("simulate_write_failure") is True:
+          raise RuntimeError("simulated downstream write failure")
+
+        order_type = payload.get("order_type")
+        encoded = json.dumps(payload, separators=(",", ":"))
+
+        if order_type == "food":
+          kitchen_path.write_text(encoded)
+          route_status_path.write_text("published to kitchen")
+          print("[route-and-enrich] published to kitchen")
+        elif order_type == "drink":
+          bar_path.write_text(encoded)
+          route_status_path.write_text("published to bar")
+          print("[route-and-enrich] published to bar")
+        else:
+          route_status_path.write_text("unsupported order_type -> manager-alerts")
+          manager_alert_path.write_text(
+            json.dumps(
+              {"reason": "unsupported order_type", "order": payload},
+              separators=(",", ":"),
+            )
+          )
+          print("[route-and-enrich] unsupported order_type -> manager-alerts")
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: dead-letter
+  labels:
+    app.kubernetes.io/name: dead-letter
+    app.kubernetes.io/part-of: lx17a-bistro-pipeline
+spec:
+  description: |
+    DLQ handler (fix for dead-letter-missing at [B]).
+    In a real system this would publish to a dead-letter topic; here it logs.
+  params:
+    - name: invalid-order
+      type: string
+    - name: error
+      type: string
+  steps:
+    - name: log
+      image: alpine:3.18
+      computeResources:
+        requests:
+          cpu: 100m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        echo "[dead-letter] sending to DLQ (simulated)"
+        echo "[dead-letter] error: $(params.error)"
+        echo "[dead-letter] order: $(params.invalid-order)"
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: bistro-pipeline
+  labels:
+    app.kubernetes.io/name: bistro-pipeline
+    app.kubernetes.io/part-of: lx17a-bistro-pipeline
+spec:
+  description: |
+    Bistro pipeline (lx17a).
+    Fixes applied:
+    - dead-letter-missing: add DLQ path for invalid orders from [B]
+    - retry-missing: enable retries and stop swallowing failures in [D]
+  params:
+    - name: order-json
+      type: string
+  tasks:
+    - name: validate-order
+      taskRef:
+        name: validate-order
+      params:
+        - name: order-json
+          value: $(params.order-json)
+    - name: route-and-enrich
+      runAfter:
+        - validate-order
+      retries: 2
+      when:
+        - input: $(tasks.validate-order.results.is-valid)
+          operator: in
+          values: ["true"]
+      taskRef:
+        name: route-and-enrich
+      params:
+        - name: order-json
+          value: $(tasks.validate-order.results.valid-order)
+    - name: dead-letter
+      runAfter:
+        - validate-order
+      when:
+        - input: $(tasks.validate-order.results.is-valid)
+          operator: in
+          values: ["false"]
+      taskRef:
+        name: dead-letter
+      params:
+        - name: invalid-order
+          value: $(tasks.validate-order.results.invalid-order)
+        - name: error
+          value: $(tasks.validate-order.results.validation-error)
